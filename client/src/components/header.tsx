@@ -32,9 +32,9 @@ export default function Header() {
             <Link href="/gallery" className="text-gray-700 hover:text-google-blue font-semibold transition-colors">
               Galeri
             </Link>
-            <a href="#help" className="text-gray-700 hover:text-google-blue font-semibold transition-colors">
+            <Link href="/help" className="text-gray-700 hover:text-google-blue font-semibold transition-colors">
               Bantuan
-            </a>
+            </Link>
           </nav>
           
           <div className="flex items-center space-x-3">

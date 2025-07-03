@@ -86,7 +86,7 @@ export default function ModeSelector() {
                       {mode.duration}
                     </Badge>
                   </div>
-                  <Button className={`${mode.buttonColor} text-white px-6 py-3 rounded-full font-bold transition-colors w-full`}>
+                  <Button className={`${mode.buttonColor} text-white px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 w-full h-12`}>
                     <Play className="mr-2 h-4 w-4" />
                     Mulai Eksperimen
                   </Button>

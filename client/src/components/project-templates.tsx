@@ -28,7 +28,7 @@ const templates = [
     id: "gestures",
     title: "Pengenal Gerakan",
     description: "Buat komputer mengerti gerakan tangan seperti rock, paper, scissors!",
-    emoji: "✋👍👎🤟",
+    emoji: "✊✋✌️📄",
     difficulty: "Sulit",
     gradient: "from-purple-400 to-pink-500",
     difficultyColor: "bg-alert-red",
@@ -94,7 +94,7 @@ export default function ProjectTemplates() {
                   <Badge className={`${template.difficultyColor} text-white`}>
                     {template.difficulty}
                   </Badge>
-                  <Button className="bg-google-blue text-white px-4 py-2 rounded-full font-bold hover:bg-blue-600 transition-colors">
+                  <Button className="bg-google-blue text-white px-6 py-3 rounded-xl font-semibold hover:bg-blue-600 transition-all hover:shadow-lg transform hover:scale-105 h-12">
                     Coba Sekarang
                   </Button>
                 </div>

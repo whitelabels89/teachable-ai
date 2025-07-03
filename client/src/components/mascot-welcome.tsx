@@ -22,7 +22,7 @@ export default function MascotWelcome() {
             </p>
             <Button 
               onClick={handleStartAdventure}
-              className="bg-sunny-yellow text-dark-text px-8 py-4 rounded-full text-lg font-bold hover:bg-orange transition-all transform hover:scale-105 shadow-lg"
+              className="bg-sunny-yellow text-dark-text px-8 py-4 rounded-xl text-lg font-semibold hover:bg-orange transition-all transform hover:scale-105 shadow-lg h-14"
             >
               <Play className="mr-2 h-5 w-5" />
               Mulai Petualangan!

@@ -117,7 +117,7 @@ export default function Gallery() {
                 : "Mulai membuat proyek AI pertama kamu!"
               }
             </p>
-            <Button className="bg-google-blue text-white hover:bg-blue-600">
+            <Button className="bg-google-blue text-white hover:bg-blue-600 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12">
               Buat Proyek Baru
             </Button>
           </div>

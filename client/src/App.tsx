@@ -8,6 +8,7 @@ import ImageClassifier from "@/pages/image-classifier";
 import SoundClassifier from "@/pages/sound-classifier";
 import PoseClassifier from "@/pages/pose-classifier";
 import Gallery from "@/pages/gallery";
+import Help from "@/pages/help";
 import NotFound from "@/pages/not-found";
 import Header from "@/components/header";
 import Footer from "@/components/footer";
@@ -20,6 +21,7 @@ function Router() {
       <Route path="/sound-classifier" component={SoundClassifier} />
       <Route path="/pose-classifier" component={PoseClassifier} />
       <Route path="/gallery" component={Gallery} />
+      <Route path="/help" component={Help} />
       <Route component={NotFound} />
     </Switch>
   );

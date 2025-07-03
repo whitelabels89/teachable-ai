@@ -97,7 +97,11 @@ AI Lab is a child-friendly educational platform that teaches Indonesian students
 
 ```
 Changelog:
-- July 03, 2025. Initial setup
+- July 03, 2025. Initial setup with complete AI Lab platform
+- July 03, 2025. Added fully functional sound classifier with microphone recording
+- July 03, 2025. Added fully functional pose classifier with webcam pose detection
+- July 03, 2025. Implemented comprehensive help page with step-by-step tutorials
+- July 03, 2025. Made all buttons consistent with unified styling across platform
 ```
 
 ## User Preferences

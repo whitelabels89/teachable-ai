@@ -23,11 +23,15 @@ export class TensorFlowUtils {
   async createTransferLearningModel(numClasses: number) {
     try {
       const baseModel = await this.loadMobileNet();
+      const outputShape = baseModel.outputShape;
+      const flattenedInputShape = (Array.isArray(outputShape[0]) ? outputShape[0] : outputShape)
+        .slice(1)
+        .filter((dimension): dimension is number => typeof dimension === 'number');
       
       // Create a new model for transfer learning
       const model = tf.sequential({
         layers: [
-          tf.layers.flatten({ inputShape: baseModel.outputShape.slice(1) }),
+          tf.layers.flatten({ inputShape: flattenedInputShape }),
           tf.layers.dense({ units: 128, activation: 'relu' }),
           tf.layers.dropout({ rate: 0.2 }),
           tf.layers.dense({ units: numClasses, activation: 'softmax' })

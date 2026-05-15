@@ -14,13 +14,19 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [capturedImages, setCapturedImages] = useState<string[]>([]);
   const [countdown, setCountdown] = useState<number | null>(null);
-  const { stream, isActive, startWebcam, stopWebcam } = useWebcam();
+  const { stream, isActive, error, startWebcam, stopWebcam } = useWebcam();
 
   useEffect(() => {
     if (stream && videoRef.current) {
       videoRef.current.srcObject = stream;
     }
   }, [stream]);
+
+  useEffect(() => {
+    return () => {
+      stopWebcam();
+    };
+  }, [stopWebcam]);
 
   const handleStartWebcam = async () => {
     try {
@@ -32,6 +38,7 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
 
   const handleCapture = () => {
     if (!videoRef.current || !canvasRef.current) return;
+    if (videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0) return;
 
     // Start countdown
     setCountdown(3);
@@ -71,6 +78,11 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
     setCapturedImages([]);
   };
 
+  const handleClose = () => {
+    handleStopWebcam();
+    onClose();
+  };
+
   return (
     <Card className="w-full max-w-4xl">
       <CardHeader>
@@ -79,7 +91,7 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
             Ambil Foto dengan Webcam
           </CardTitle>
           <Button
-            onClick={onClose}
+            onClick={handleClose}
             variant="ghost"
             size="icon"
             className="h-8 w-8"
@@ -163,6 +175,12 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
             )}
           </div>
 
+          {error && (
+            <div className="rounded-xl border border-red-300 bg-red-50 p-4 text-sm text-red-700">
+              {error}
+            </div>
+          )}
+
           {/* Captured Images Preview */}
           {capturedImages.length > 0 && (
             <div>
@@ -177,7 +195,7 @@ export default function WebcamCapture({ onCapture, onClose }: WebcamCaptureProps
                     />
                   </div>
                 ))}
-                {Array.from({ length: 4 - capturedImages.length }).map((_, index) => (
+                {Array.from({ length: Math.max(0, 4 - capturedImages.length) }).map((_, index) => (
                   <div key={`empty-${index}`} className="aspect-square bg-gray-100 rounded-lg flex items-center justify-center text-gray-400 border-2 border-dashed">
                     <Camera className="h-8 w-8" />
                   </div>

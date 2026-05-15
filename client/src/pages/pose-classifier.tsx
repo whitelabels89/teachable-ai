@@ -5,16 +5,16 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import { Separator } from "@/components/ui/separator";
-import { UserCheck, Camera, Play, Users, ArrowLeft, Plus, Trash2, Brain, TestTube, Video, Square } from "lucide-react";
+import { UserCheck, Camera, ArrowLeft, Plus, Trash2, Brain, TestTube, Square } from "lucide-react";
 import { Link } from "wouter";
 import { useToast } from "@/hooks/use-toast";
+import { useWebcam } from "@/hooks/use-webcam";
 
 interface PoseSample {
   id: string;
-  keypoints: any[]; // Pose keypoints from PoseNet
+  features: number[];
   timestamp: number;
-  imageData: string; // base64 encoded image
+  imageData: string;
 }
 
 interface PoseClass {
@@ -25,6 +25,63 @@ interface PoseClass {
   color: string;
 }
 
+interface TrainedPoseClass {
+  classId: string;
+  className: string;
+  emoji: string;
+  centroid: number[];
+}
+
+interface PosePrediction {
+  classId: string;
+  className: string;
+  emoji: string;
+  confidence: number;
+}
+
+const createId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const cosineSimilarity = (a: number[], b: number[]) => {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i += 1) {
+    const aValue = a[i] ?? 0;
+    const bValue = b[i] ?? 0;
+    dot += aValue * bValue;
+    normA += aValue * aValue;
+    normB += bValue * bValue;
+  }
+
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+};
+
+const computeCentroid = (vectors: number[][]) => {
+  if (vectors.length === 0) {
+    return [];
+  }
+
+  const vectorLength = vectors[0].length;
+  const centroid = new Array(vectorLength).fill(0);
+
+  for (const vector of vectors) {
+    for (let i = 0; i < vectorLength; i += 1) {
+      centroid[i] += vector[i] ?? 0;
+    }
+  }
+
+  for (let i = 0; i < vectorLength; i += 1) {
+    centroid[i] /= vectors.length;
+  }
+
+  return centroid;
+};
+
 export default function PoseClassifier() {
   const [classes, setClasses] = useState<PoseClass[]>([
     {
@@ -32,333 +89,448 @@ export default function PoseClassifier() {
       name: "Tangan Kanan Naik",
       emoji: "🤚",
       samples: [],
-      color: "from-purple to-pink-400"
+      color: "from-purple to-pink-400",
     },
     {
-      id: "2", 
+      id: "2",
       name: "Tangan Kiri Naik",
       emoji: "✋",
       samples: [],
-      color: "from-google-blue to-blue-600"
-    }
+      color: "from-google-blue to-blue-600",
+    },
   ]);
-  
+
   const [isCapturing, setIsCapturing] = useState(false);
   const [capturingClassId, setCapturingClassId] = useState<string | null>(null);
   const [isTraining, setIsTraining] = useState(false);
   const [trainingProgress, setTrainingProgress] = useState(0);
+  const [trainingMessage, setTrainingMessage] = useState("Belum training");
   const [modelTrained, setModelTrained] = useState(false);
+  const [trainedClasses, setTrainedClasses] = useState<TrainedPoseClass[]>([]);
   const [isTesting, setIsTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
+  const [testCountdown, setTestCountdown] = useState(0);
+  const [predictions, setPredictions] = useState<PosePrediction[]>([]);
   const [newClassName, setNewClassName] = useState("");
   const [newClassEmoji, setNewClassEmoji] = useState("🤸");
   const [captureCount, setCaptureCount] = useState(0);
   const [showAddClass, setShowAddClass] = useState(false);
-  const [webcamActive, setWebcamActive] = useState(false);
-  
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const autoStopCaptureRef = useRef<number | null>(null);
+  const testTimeoutRef = useRef<number | null>(null);
+  const testCountdownRef = useRef<number | null>(null);
+  const captureCountRef = useRef(0);
+
   const { toast } = useToast();
+  const { stream, isActive: webcamActive, error: webcamError, startWebcam, stopWebcam } = useWebcam();
 
   const colorOptions = [
     "from-purple to-pink-400",
-    "from-google-blue to-blue-600", 
+    "from-google-blue to-blue-600",
     "from-success-green to-green-400",
     "from-orange to-yellow-400",
-    "from-alert-red to-red-400"
+    "from-alert-red to-red-400",
   ];
 
-  // Initialize webcam
+  useEffect(() => {
+    if (stream && videoRef.current) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(() => {
+        // Ignore autoplay block, user interaction button will re-trigger.
+      });
+    }
+  }, [stream]);
+
   useEffect(() => {
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
+      if (captureIntervalRef.current) {
+        clearInterval(captureIntervalRef.current);
       }
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
+      if (autoStopCaptureRef.current) {
+        window.clearTimeout(autoStopCaptureRef.current);
       }
+      if (testTimeoutRef.current) {
+        window.clearTimeout(testTimeoutRef.current);
+      }
+      if (testCountdownRef.current) {
+        window.clearInterval(testCountdownRef.current);
+      }
+      stopWebcam();
     };
-  }, []);
+  }, [stopWebcam]);
 
-  const startWebcam = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { 
-          width: 640, 
-          height: 480,
-          facingMode: 'user'
-        } 
-      });
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        streamRef.current = stream;
-        setWebcamActive(true);
-      }
-    } catch (error) {
-      console.error('Error accessing webcam:', error);
-      toast({
-        title: "Error",
-        description: "Tidak dapat mengakses kamera. Pastikan izin kamera telah diberikan.",
-        variant: "destructive"
-      });
-    }
-  };
-
-  const stopWebcam = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    setWebcamActive(false);
-    setIsCapturing(false);
-    setCapturingClassId(null);
+  const markModelAsDirty = () => {
+    setModelTrained(false);
+    setTrainedClasses([]);
+    setPredictions([]);
   };
 
   const addClass = () => {
-    if (!newClassName.trim()) return;
-    
+    if (!newClassName.trim()) {
+      return;
+    }
+
     const newClass: PoseClass = {
-      id: Date.now().toString(),
+      id: createId(),
       name: newClassName.trim(),
-      emoji: newClassEmoji,
+      emoji: newClassEmoji || "🤸",
       samples: [],
-      color: colorOptions[classes.length % colorOptions.length]
+      color: colorOptions[classes.length % colorOptions.length],
     };
-    
-    setClasses(prev => [...prev, newClass]);
+
+    setClasses((prev) => [...prev, newClass]);
     setNewClassName("");
     setNewClassEmoji("🤸");
     setShowAddClass(false);
-    
+    markModelAsDirty();
+
     toast({
-      title: "Kelas berhasil ditambahkan!",
-      description: `Kelas "${newClass.name}" siap untuk dilatih`
+      title: "Kelas ditambahkan",
+      description: `Kelas "${newClass.name}" siap direkam.`,
     });
   };
 
   const removeClass = (classId: string) => {
-    setClasses(prev => prev.filter(c => c.id !== classId));
+    setClasses((prev) => prev.filter((item) => item.id !== classId));
+    markModelAsDirty();
     toast({
       title: "Kelas dihapus",
-      description: "Kelas dan semua sampel pose telah dihapus"
+      description: "Kelas dan sampel pose terkait telah dihapus.",
     });
+  };
+
+  const stopAllTimers = () => {
+    if (captureIntervalRef.current) {
+      clearInterval(captureIntervalRef.current);
+      captureIntervalRef.current = null;
+    }
+
+    if (autoStopCaptureRef.current) {
+      window.clearTimeout(autoStopCaptureRef.current);
+      autoStopCaptureRef.current = null;
+    }
+
+    if (testTimeoutRef.current) {
+      window.clearTimeout(testTimeoutRef.current);
+      testTimeoutRef.current = null;
+    }
+
+    if (testCountdownRef.current) {
+      window.clearInterval(testCountdownRef.current);
+      testCountdownRef.current = null;
+    }
+  };
+
+  const extractFeaturesFromCanvas = (sourceCanvas: HTMLCanvasElement) => {
+    const featureCanvas = document.createElement("canvas");
+    const featureSize = 16;
+    featureCanvas.width = featureSize;
+    featureCanvas.height = featureSize;
+
+    const featureCtx = featureCanvas.getContext("2d");
+    if (!featureCtx) {
+      throw new Error("Tidak bisa mengambil konteks gambar.");
+    }
+
+    featureCtx.drawImage(sourceCanvas, 0, 0, featureSize, featureSize);
+    const pixelData = featureCtx.getImageData(0, 0, featureSize, featureSize).data;
+
+    const features: number[] = [];
+    for (let i = 0; i < pixelData.length; i += 4) {
+      const r = pixelData[i] ?? 0;
+      const g = pixelData[i + 1] ?? 0;
+      const b = pixelData[i + 2] ?? 0;
+      const gray = (r + g + b) / (3 * 255);
+      features.push(gray);
+    }
+
+    const norm = Math.sqrt(features.reduce((sum, value) => sum + value * value, 0)) || 1;
+    return features.map((value) => value / norm);
+  };
+
+  const captureCurrentFrame = () => {
+    if (!videoRef.current || !canvasRef.current) {
+      return null;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      return null;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return null;
+    }
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const imageData = canvas.toDataURL("image/jpeg", 0.8);
+    const features = extractFeaturesFromCanvas(canvas);
+
+    return { imageData, features };
+  };
+
+  const capturePoseSample = (classId: string) => {
+    const frame = captureCurrentFrame();
+    if (!frame) {
+      return;
+    }
+
+    const sample: PoseSample = {
+      id: createId(),
+      features: frame.features,
+      timestamp: Date.now(),
+      imageData: frame.imageData,
+    };
+
+    setClasses((prev) =>
+      prev.map((item) => (item.id === classId ? { ...item, samples: [...item.samples, sample] } : item)),
+    );
+
+    captureCountRef.current += 1;
+    setCaptureCount(captureCountRef.current);
+  };
+
+  const startCamera = async () => {
+    try {
+      await startWebcam();
+      return true;
+    } catch (error) {
+      toast({
+        title: "Gagal menyalakan kamera",
+        description: error instanceof Error ? error.message : "Pastikan izin kamera sudah diberikan.",
+        variant: "destructive",
+      });
+      return false;
+    }
+  };
+
+  const stopCamera = () => {
+    stopAllTimers();
+    stopWebcam();
+    setIsCapturing(false);
+    setCapturingClassId(null);
+    setCaptureCount(0);
+    captureCountRef.current = 0;
+    setIsTesting(false);
+    setTestCountdown(0);
+  };
+
+  const stopCapturing = () => {
+    if (!isCapturing) {
+      return;
+    }
+
+    setIsCapturing(false);
+    setCapturingClassId(null);
+    stopAllTimers();
+
+    toast({
+      title: "Perekaman pose selesai",
+      description: `${captureCountRef.current} frame berhasil disimpan.`,
+    });
+
+    captureCountRef.current = 0;
+    setCaptureCount(0);
   };
 
   const startCapturing = async (classId: string) => {
     if (!webcamActive) {
-      await startWebcam();
+      const started = await startCamera();
+      if (!started) return;
     }
-    
+
+    stopAllTimers();
     setIsCapturing(true);
     setCapturingClassId(classId);
     setCaptureCount(0);
-    
-    // Simulate pose detection and capture
-    intervalRef.current = setInterval(() => {
-      capturePose(classId);
-    }, 1000); // Capture every second
-    
-    toast({
-      title: "Mulai menangkap pose",
-      description: "Lakukan gerakan yang konsisten selama 5 detik"
-    });
-    
-    // Auto stop after 5 seconds
-    setTimeout(() => {
+    captureCountRef.current = 0;
+
+    markModelAsDirty();
+    capturePoseSample(classId);
+
+    captureIntervalRef.current = setInterval(() => {
+      capturePoseSample(classId);
+      if (captureCountRef.current >= 6) {
+        stopCapturing();
+      }
+    }, 800);
+
+    autoStopCaptureRef.current = window.setTimeout(() => {
       stopCapturing();
-    }, 5000);
-  };
+    }, 5500);
 
-  const stopCapturing = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    
-    setIsCapturing(false);
-    setCapturingClassId(null);
-    setCaptureCount(0);
-    
     toast({
-      title: "Penangkapan pose selesai",
-      description: "Pose berhasil disimpan"
+      title: "Mulai merekam pose",
+      description: "Tahan pose dengan stabil selama beberapa detik.",
     });
-  };
-
-  const capturePose = (classId: string) => {
-    if (!videoRef.current || !canvasRef.current) return;
-    
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    
-    if (!ctx) return;
-    
-    // Set canvas size to match video
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    
-    // Draw current video frame to canvas
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    
-    // Get image data
-    const imageData = canvas.toDataURL('image/jpeg', 0.8);
-    
-    // Simulate pose keypoints (in a real app, this would come from PoseNet)
-    const mockKeypoints = generateMockKeypoints(classId);
-    
-    const sample: PoseSample = {
-      id: Date.now().toString() + Math.random(),
-      keypoints: mockKeypoints,
-      timestamp: Date.now(),
-      imageData
-    };
-    
-    setClasses(prev => prev.map(c => 
-      c.id === classId 
-        ? { ...c, samples: [...c.samples, sample] }
-        : c
-    ));
-    
-    setCaptureCount(prev => prev + 1);
-  };
-
-  // Generate mock pose keypoints for demonstration
-  const generateMockKeypoints = (classId: string) => {
-    const baseKeypoints = [];
-    for (let i = 0; i < 17; i++) { // PoseNet has 17 keypoints
-      baseKeypoints.push({
-        score: Math.random() * 0.5 + 0.5, // 0.5 to 1.0
-        part: `keypoint_${i}`,
-        position: {
-          x: Math.random() * 640,
-          y: Math.random() * 480
-        }
-      });
-    }
-    
-    // Modify keypoints based on class to create variation
-    if (classId === "1") { // Right hand up
-      baseKeypoints[10] = { // Right wrist
-        score: 0.9,
-        part: "rightWrist",
-        position: { x: 400, y: 150 }
-      };
-    } else if (classId === "2") { // Left hand up
-      baseKeypoints[9] = { // Left wrist
-        score: 0.9,
-        part: "leftWrist", 
-        position: { x: 240, y: 150 }
-      };
-    }
-    
-    return baseKeypoints;
   };
 
   const removeSample = (classId: string, sampleId: string) => {
-    setClasses(prev => prev.map(c => 
-      c.id === classId 
-        ? { ...c, samples: c.samples.filter(s => s.id !== sampleId) }
-        : c
-    ));
+    setClasses((prev) =>
+      prev.map((item) =>
+        item.id === classId ? { ...item, samples: item.samples.filter((sample) => sample.id !== sampleId) } : item,
+      ),
+    );
+    markModelAsDirty();
   };
 
   const trainModel = async () => {
     if (classes.length < 2) {
       toast({
-        title: "Tidak cukup kelas",
-        description: "Minimal 2 kelas diperlukan untuk melatih model",
-        variant: "destructive"
+        title: "Kelas belum cukup",
+        description: "Minimal 2 kelas diperlukan untuk training.",
+        variant: "destructive",
       });
       return;
     }
 
-    const hasEnoughSamples = classes.every(c => c.samples.length >= 3);
-    if (!hasEnoughSamples) {
+    if (classes.some((item) => item.samples.length < 3)) {
       toast({
-        title: "Tidak cukup sampel",
-        description: "Setiap kelas minimal membutuhkan 3 sampel pose",
-        variant: "destructive"
+        title: "Sampel belum cukup",
+        description: "Setiap kelas minimal harus punya 3 sampel pose.",
+        variant: "destructive",
       });
       return;
     }
 
     setIsTraining(true);
     setTrainingProgress(0);
-    setModelTrained(false);
+    setTrainingMessage("Memproses sampel pose...");
 
-    // Simulate training process
-    const steps = [
-      { progress: 15, message: "Memproses keypoints..." },
-      { progress: 35, message: "Ekstraksi fitur pose..." },
-      { progress: 55, message: "Inisialisasi model..." },
-      { progress: 75, message: "Pelatihan neural network..." },
-      { progress: 90, message: "Validasi model..." },
-      { progress: 100, message: "Pelatihan selesai!" }
-    ];
+    try {
+      const prepared: TrainedPoseClass[] = [];
 
-    for (const step of steps) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      setTrainingProgress(step.progress);
+      for (let i = 0; i < classes.length; i += 1) {
+        const poseClass = classes[i];
+        const vectors = poseClass.samples.map((sample) => sample.features);
+
+        prepared.push({
+          classId: poseClass.id,
+          className: poseClass.name,
+          emoji: poseClass.emoji,
+          centroid: computeCentroid(vectors),
+        });
+
+        const stepProgress = Math.round(((i + 1) / classes.length) * 100);
+        setTrainingProgress(stepProgress);
+        setTrainingMessage(`Mempelajari pola kelas ${poseClass.name}...`);
+
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+      }
+
+      setTrainedClasses(prepared);
+      setModelTrained(true);
+      setTrainingMessage("Training selesai");
+
+      toast({
+        title: "Model gerakan siap",
+        description: "Model sudah bisa diuji dengan kamera langsung.",
+      });
+    } catch (error) {
+      setModelTrained(false);
+      setTrainedClasses([]);
+      toast({
+        title: "Training gagal",
+        description: error instanceof Error ? error.message : "Terjadi kesalahan saat training.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsTraining(false);
     }
+  };
 
-    setIsTraining(false);
-    setModelTrained(true);
-    toast({
-      title: "Model berhasil dilatih!",
-      description: "Sekarang Anda dapat menguji model dengan pose baru"
-    });
+  const classifyPose = (features: number[]) => {
+    const scored = trainedClasses.map((trainedClass) => ({
+      ...trainedClass,
+      similarity: cosineSimilarity(features, trainedClass.centroid),
+    }));
+
+    const expScores = scored.map((item) => Math.exp(item.similarity * 4));
+    const sumExp = expScores.reduce((sum, value) => sum + value, 0) || 1;
+
+    return scored
+      .map((item, index) => ({
+        classId: item.classId,
+        className: item.className,
+        emoji: item.emoji,
+        confidence: expScores[index] / sumExp,
+      }))
+      .sort((a, b) => b.confidence - a.confidence);
   };
 
   const testModel = async () => {
-    if (!modelTrained) {
+    if (!modelTrained || trainedClasses.length === 0) {
       toast({
-        title: "Model belum dilatih",
-        description: "Latih model terlebih dahulu sebelum menguji",
-        variant: "destructive"
+        title: "Model belum siap",
+        description: "Lakukan training terlebih dahulu.",
+        variant: "destructive",
       });
       return;
     }
 
     if (!webcamActive) {
-      await startWebcam();
+      const started = await startCamera();
+      if (!started) return;
     }
 
     setIsTesting(true);
-    setTestResult(null);
-    
-    toast({
-      title: "Menguji model...",
-      description: "Lakukan pose selama 3 detik"
-    });
+    setPredictions([]);
+    setTestCountdown(3);
 
-    // Simulate testing for 3 seconds
-    setTimeout(() => {
-      // Simulate prediction
-      const availableClasses = classes.filter(c => c.samples.length > 0);
-      const randomClass = availableClasses[Math.floor(Math.random() * availableClasses.length)];
-      const confidence = Math.random() * 0.3 + 0.7; // 70-100%
-      
-      setTestResult(`${randomClass.emoji} ${randomClass.name} (${Math.round(confidence * 100)}%)`);
-      setIsTesting(false);
-      
-      toast({
-        title: "Prediksi selesai",
-        description: `Hasil: ${randomClass.name} dengan confidence ${Math.round(confidence * 100)}%`
+    testCountdownRef.current = window.setInterval(() => {
+      setTestCountdown((prev) => {
+        if (prev <= 1) {
+          if (testCountdownRef.current) {
+            window.clearInterval(testCountdownRef.current);
+            testCountdownRef.current = null;
+          }
+          return 0;
+        }
+        return prev - 1;
       });
+    }, 1000);
+
+    testTimeoutRef.current = window.setTimeout(() => {
+      const frame = captureCurrentFrame();
+
+      if (!frame) {
+        setIsTesting(false);
+        toast({
+          title: "Pengujian gagal",
+          description: "Frame kamera tidak terbaca. Coba lagi.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const result = classifyPose(frame.features);
+      setPredictions(result);
+      setIsTesting(false);
+
+      const top = result[0];
+      if (top) {
+        toast({
+          title: "Prediksi selesai",
+          description: `${top.emoji} ${top.className} (${Math.round(top.confidence * 100)}%)`,
+        });
+      }
     }, 3000);
   };
 
-  const totalSamples = classes.reduce((sum, c) => sum + c.samples.length, 0);
+  const totalSamples = classes.reduce((sum, item) => sum + item.samples.length, 0);
+  const topPrediction = predictions[0] ?? null;
 
   return (
     <div className="min-h-screen bg-light-gray py-8">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        
-        {/* Header */}
         <div className="flex items-center justify-between mb-8">
           <div className="flex items-center space-x-4">
             <Link href="/">
@@ -369,78 +541,67 @@ export default function PoseClassifier() {
             </Link>
             <div>
               <h1 className="text-3xl font-fredoka text-dark-text">Klasifikasi Gerakan</h1>
-              <p className="text-gray-600">Ajarkan AI untuk mengenali pose tubuh dan gerakan</p>
+              <p className="text-gray-600">Latih model dari pose tubuh nyata lewat kamera</p>
             </div>
           </div>
           <div className="flex items-center space-x-3">
-            <Badge className="bg-success-green text-white">
-              {totalSamples} Sampel
-            </Badge>
-            <Badge className="bg-google-blue text-white">
-              {classes.length} Kelas
-            </Badge>
+            <Badge className="bg-success-green text-white">{totalSamples} Sampel</Badge>
+            <Badge className="bg-google-blue text-white">{classes.length} Kelas</Badge>
           </div>
         </div>
 
-        {/* Webcam Section */}
         <Card className="mb-8 bg-white rounded-3xl shadow-xl">
           <CardHeader>
             <CardTitle className="text-xl font-fredoka text-dark-text">Kamera</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              <div className="relative bg-gray-900 rounded-2xl overflow-hidden" style={{ aspectRatio: '4/3' }}>
+              <div className="relative bg-gray-900 rounded-2xl overflow-hidden" style={{ aspectRatio: "4/3" }}>
                 {webcamActive ? (
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    playsInline
-                    muted
-                    className="w-full h-full object-cover"
-                    onLoadedData={() => {
-                      if (videoRef.current) {
-                        videoRef.current.play();
-                      }
-                    }}
-                  />
+                  <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
                 ) : (
                   <div className="flex items-center justify-center h-full text-white">
                     <div className="text-center">
-                      <Camera className="text-6xl mb-4 mx-auto opacity-50" />
+                      <Camera className="h-16 w-16 mb-4 mx-auto opacity-50" />
                       <p className="text-lg">Kamera belum aktif</p>
                     </div>
                   </div>
                 )}
-                
+
                 {isCapturing && (
                   <div className="absolute top-4 left-4 bg-red-500 text-white px-3 py-1 rounded-full text-sm font-bold flex items-center">
-                    <div className="w-2 h-2 bg-white rounded-full mr-2 animate-pulse"></div>
-                    Menangkap Pose ({captureCount}/5)
+                    <div className="w-2 h-2 bg-white rounded-full mr-2 animate-pulse" />
+                    Menangkap Pose ({captureCount}/6)
+                  </div>
+                )}
+
+                {isTesting && (
+                  <div className="absolute inset-0 bg-black/30 flex items-center justify-center">
+                    <div className="text-white text-6xl font-bold">{testCountdown > 0 ? testCountdown : "GO"}</div>
                   </div>
                 )}
               </div>
-              
+
+              {webcamError && <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-sm text-red-700">{webcamError}</div>}
+
               <div className="flex justify-center space-x-4">
                 <Button
-                  onClick={webcamActive ? stopWebcam : startWebcam}
+                  onClick={webcamActive ? stopCamera : startCamera}
                   className={`px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12 ${
-                    webcamActive 
-                      ? 'bg-alert-red text-white hover:bg-red-600' 
-                      : 'bg-success-green text-white hover:bg-green-600'
+                    webcamActive ? "bg-alert-red text-white hover:bg-red-600" : "bg-success-green text-white hover:bg-green-600"
                   }`}
                 >
                   <Camera className="mr-2 h-4 w-4" />
-                  {webcamActive ? 'Matikan Kamera' : 'Nyalakan Kamera'}
+                  {webcamActive ? "Matikan Kamera" : "Nyalakan Kamera"}
                 </Button>
               </div>
             </div>
           </CardContent>
         </Card>
 
-        {/* Add New Class Button */}
         {!showAddClass && (
           <div className="text-center mb-8">
-            <Button 
+            <Button
               onClick={() => setShowAddClass(true)}
               className="bg-purple text-white hover:bg-purple/80 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12"
             >
@@ -450,7 +611,6 @@ export default function PoseClassifier() {
           </div>
         )}
 
-        {/* Add New Class Form */}
         {showAddClass && (
           <Card className="mb-8 bg-white rounded-3xl shadow-xl">
             <CardHeader>
@@ -462,10 +622,14 @@ export default function PoseClassifier() {
                   <Label htmlFor="className">Nama Kelas</Label>
                   <Input
                     id="className"
-                    placeholder="Contoh: Tangan Kedua Naik, Pose T"
+                    placeholder="Contoh: Pose T, Dua Tangan Naik"
                     value={newClassName}
-                    onChange={(e) => setNewClassName(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && addClass()}
+                    onChange={(event) => setNewClassName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        addClass();
+                      }
+                    }}
                   />
                 </div>
                 <div>
@@ -474,10 +638,10 @@ export default function PoseClassifier() {
                     id="classEmoji"
                     className="w-20 text-center"
                     value={newClassEmoji}
-                    onChange={(e) => setNewClassEmoji(e.target.value)}
+                    onChange={(event) => setNewClassEmoji(event.target.value)}
                   />
                 </div>
-                <Button 
+                <Button
                   onClick={addClass}
                   disabled={!newClassName.trim()}
                   className="bg-success-green text-white hover:bg-green-600 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12"
@@ -485,11 +649,7 @@ export default function PoseClassifier() {
                   <Plus className="mr-2 h-4 w-4" />
                   Tambah
                 </Button>
-                <Button 
-                  variant="outline"
-                  onClick={() => setShowAddClass(false)}
-                  className="px-6 py-3 rounded-xl font-semibold h-12"
-                >
+                <Button variant="outline" onClick={() => setShowAddClass(false)} className="px-6 py-3 rounded-xl font-semibold h-12">
                   Batal
                 </Button>
               </div>
@@ -497,7 +657,6 @@ export default function PoseClassifier() {
           </Card>
         )}
 
-        {/* Classes Grid */}
         <div className="grid lg:grid-cols-2 gap-6 mb-8">
           {classes.map((poseClass) => (
             <Card key={poseClass.id} className={`bg-gradient-to-br ${poseClass.color} text-white rounded-3xl shadow-xl`}>
@@ -507,45 +666,36 @@ export default function PoseClassifier() {
                     <div className="text-3xl">{poseClass.emoji}</div>
                     <div>
                       <CardTitle className="text-2xl font-fredoka">{poseClass.name}</CardTitle>
-                      <Badge className="bg-white text-gray-800 font-bold w-fit">
-                        {poseClass.samples.length} pose
-                      </Badge>
+                      <Badge className="bg-white text-gray-800 font-bold w-fit">{poseClass.samples.length} pose</Badge>
                     </div>
                   </div>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => removeClass(poseClass.id)}
-                    className="text-white hover:bg-white/20"
-                  >
+                  <Button variant="ghost" size="sm" onClick={() => removeClass(poseClass.id)} className="text-white hover:bg-white/20">
                     <Trash2 className="h-4 w-4" />
                   </Button>
                 </div>
               </CardHeader>
               <CardContent>
                 <div className="space-y-4">
-                  {/* Capture Area */}
                   <div className="border-4 border-dashed border-white rounded-2xl p-8 text-center">
                     {isCapturing && capturingClassId === poseClass.id ? (
                       <div className="space-y-4">
                         <div className="flex items-center justify-center space-x-2">
-                          <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+                          <div className="w-3 h-3 bg-white rounded-full animate-pulse" />
                           <span className="text-lg font-bold">Menangkap Pose</span>
                         </div>
-                        <div className="text-2xl font-bold">{captureCount}/5</div>
+                        <div className="text-2xl font-bold">{captureCount}/6</div>
                       </div>
                     ) : (
                       <div className="space-y-4">
-                        <UserCheck className="text-4xl mx-auto" />
+                        <UserCheck className="h-10 w-10 mx-auto" />
                         <div>
-                          <p className="text-lg font-bold mb-2">Lakukan pose {poseClass.name.toLowerCase()}</p>
-                          <p className="opacity-75">Klik untuk mulai menangkap gerakan</p>
+                          <p className="text-lg font-bold mb-2">Rekam pose {poseClass.name.toLowerCase()}</p>
+                          <p className="opacity-75">Tahan pose 4-6 detik untuk hasil stabil</p>
                         </div>
                       </div>
                     )}
                   </div>
-                  
-                  {/* Action Buttons */}
+
                   <div className="flex space-x-4">
                     {isCapturing && capturingClassId === poseClass.id ? (
                       <Button
@@ -556,37 +706,32 @@ export default function PoseClassifier() {
                         Berhenti
                       </Button>
                     ) : (
-                      <>
-                        <Button
-                          onClick={() => startCapturing(poseClass.id)}
-                          disabled={isCapturing || !webcamActive}
-                          className="flex-1 bg-white text-gray-800 hover:bg-gray-100 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12"
-                        >
-                          <Camera className="mr-2 h-4 w-4" />
-                          Rekam Gerakan
-                        </Button>
-                        <Button
-                          className="flex-1 bg-white text-gray-800 hover:bg-gray-100 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12"
-                        >
-                          <Play className="mr-2 h-4 w-4" />
-                          Lihat Contoh
-                        </Button>
-                      </>
+                      <Button
+                        onClick={() => {
+                          startCapturing(poseClass.id).catch(() => {
+                            toast({
+                              title: "Perekaman gagal",
+                              description: "Tidak bisa memulai perekaman pose.",
+                              variant: "destructive",
+                            });
+                          });
+                        }}
+                        disabled={isCapturing || !webcamActive || isTraining || isTesting}
+                        className="flex-1 bg-white text-gray-800 hover:bg-gray-100 px-6 py-3 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-12"
+                      >
+                        <Camera className="mr-2 h-4 w-4" />
+                        Rekam Gerakan
+                      </Button>
                     )}
                   </div>
 
-                  {/* Samples List */}
                   {poseClass.samples.length > 0 && (
                     <div className="space-y-2">
                       <h4 className="font-bold text-white">Pose Tersimpan:</h4>
                       <div className="grid grid-cols-3 gap-2">
                         {poseClass.samples.slice(0, 6).map((sample, index) => (
                           <div key={sample.id} className="relative group">
-                            <img 
-                              src={sample.imageData} 
-                              alt={`Pose ${index + 1}`}
-                              className="w-full aspect-square object-cover rounded-lg"
-                            />
+                            <img src={sample.imageData} alt={`Pose ${index + 1}`} className="w-full aspect-square object-cover rounded-lg" />
                             <Button
                               variant="ghost"
                               size="sm"
@@ -598,11 +743,7 @@ export default function PoseClassifier() {
                           </div>
                         ))}
                       </div>
-                      {poseClass.samples.length > 6 && (
-                        <p className="text-sm text-white/80">
-                          +{poseClass.samples.length - 6} pose lainnya
-                        </p>
-                      )}
+                      {poseClass.samples.length > 6 && <p className="text-sm text-white/80">+{poseClass.samples.length - 6} pose lainnya</p>}
                     </div>
                   )}
                 </div>
@@ -611,11 +752,10 @@ export default function PoseClassifier() {
           ))}
         </div>
 
-        {/* Training Section */}
         {totalSamples > 0 && (
           <Card className="mb-8 bg-white rounded-3xl shadow-xl">
             <CardHeader>
-              <CardTitle className="text-xl font-fredoka text-dark-text">Latih Model AI</CardTitle>
+              <CardTitle className="text-xl font-fredoka text-dark-text">Latih Model Gerakan</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="space-y-6">
@@ -623,31 +763,34 @@ export default function PoseClassifier() {
                   <div className="space-y-4">
                     <div className="flex items-center space-x-4">
                       <Brain className="h-6 w-6 text-google-blue animate-pulse" />
-                      <span className="text-lg font-medium">Melatih model AI...</span>
+                      <span className="text-lg font-medium">{trainingMessage}</span>
                     </div>
                     <Progress value={trainingProgress} className="h-3" />
-                    <p className="text-sm text-gray-600 text-center">
-                      {trainingProgress}% selesai
-                    </p>
+                    <p className="text-sm text-gray-600 text-center">{trainingProgress}% selesai</p>
                   </div>
                 ) : (
                   <div className="text-center space-y-4">
                     <Button
-                      onClick={trainModel}
-                      disabled={classes.length < 2 || totalSamples < 6}
+                      onClick={() => {
+                        trainModel().catch(() => {
+                          toast({
+                            title: "Training gagal",
+                            description: "Terjadi kesalahan tak terduga.",
+                            variant: "destructive",
+                          });
+                        });
+                      }}
+                      disabled={classes.length < 2 || classes.some((item) => item.samples.length < 3)}
                       className="bg-success-green text-white hover:bg-green-600 px-8 py-4 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-14"
                     >
                       <Brain className="mr-2 h-5 w-5" />
                       Latih Model AI
                     </Button>
-                    {modelTrained && (
-                      <Badge className="bg-success-green text-white">
-                        Model Sudah Dilatih
-                      </Badge>
-                    )}
+                    {modelTrained && <Badge className="bg-success-green text-white">Model Sudah Dilatih</Badge>}
                     <p className="text-sm text-gray-600">
                       {classes.length < 2 && "Minimal 2 kelas diperlukan"}
-                      {classes.length >= 2 && totalSamples < 6 && "Minimal 3 pose per kelas diperlukan"}
+                      {classes.length >= 2 && classes.some((item) => item.samples.length < 3) && "Setiap kelas butuh minimal 3 sampel pose"}
+                      {classes.length >= 2 && !classes.some((item) => item.samples.length < 3) && "Model akan membandingkan pola visual antar pose"}
                     </p>
                   </div>
                 )}
@@ -656,7 +799,6 @@ export default function PoseClassifier() {
           </Card>
         )}
 
-        {/* Testing Section */}
         {modelTrained && (
           <Card className="bg-white rounded-3xl shadow-xl">
             <CardHeader>
@@ -664,30 +806,48 @@ export default function PoseClassifier() {
             </CardHeader>
             <CardContent>
               <div className="text-center space-y-6">
-                <p className="text-gray-600">
-                  Klik tombol di bawah untuk menguji model dengan pose baru (durasi 3 detik)
-                </p>
-                
+                <p className="text-gray-600">Klik tombol di bawah untuk menguji model dengan pose baru (3 detik)</p>
+
                 <Button
-                  onClick={testModel}
-                  disabled={isTesting || !webcamActive}
+                  onClick={() => {
+                    testModel().catch(() => {
+                      toast({
+                        title: "Pengujian gagal",
+                        description: "Terjadi kesalahan tak terduga.",
+                        variant: "destructive",
+                      });
+                    });
+                  }}
+                  disabled={isTesting || !webcamActive || isTraining}
                   className="bg-orange text-white hover:bg-orange/80 px-8 py-4 rounded-xl font-semibold transition-all hover:shadow-lg transform hover:scale-105 h-14"
                 >
                   <TestTube className="mr-2 h-5 w-5" />
-                  {isTesting ? "Menguji..." : "Uji Model"}
+                  {isTesting ? "Menganalisis..." : "Uji Model"}
                 </Button>
 
-                {!webcamActive && (
-                  <p className="text-sm text-gray-500">
-                    Nyalakan kamera terlebih dahulu untuk menguji model
-                  </p>
-                )}
+                {!webcamActive && <p className="text-sm text-gray-500">Nyalakan kamera terlebih dahulu untuk pengujian model.</p>}
 
-                {testResult && (
-                  <div className="bg-success-green bg-opacity-10 rounded-2xl p-6">
-                    <h3 className="text-lg font-fredoka text-dark-text mb-2">Hasil Prediksi:</h3>
-                    <div className="text-2xl font-bold text-success-green">
-                      {testResult}
+                {topPrediction && (
+                  <div className="space-y-4">
+                    <div className="bg-success-green/10 rounded-2xl p-6">
+                      <h3 className="text-lg font-fredoka text-dark-text mb-2">Hasil Utama:</h3>
+                      <div className="text-3xl font-bold text-success-green">
+                        {topPrediction.emoji} {topPrediction.className} ({Math.round(topPrediction.confidence * 100)}%)
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      {predictions.map((prediction) => (
+                        <div key={prediction.classId} className="bg-gray-50 rounded-xl p-4 text-left">
+                          <div className="flex justify-between items-center mb-2">
+                            <span className="font-semibold text-dark-text">
+                              {prediction.emoji} {prediction.className}
+                            </span>
+                            <span className="font-bold text-google-blue">{Math.round(prediction.confidence * 100)}%</span>
+                          </div>
+                          <Progress value={prediction.confidence * 100} className="h-2" />
+                        </div>
+                      ))}
                     </div>
                   </div>
                 )}
@@ -696,24 +856,17 @@ export default function PoseClassifier() {
           </Card>
         )}
 
-        {/* Instructions */}
         {totalSamples === 0 && (
           <div className="text-center py-16">
             <div className="text-6xl mb-6">🤸‍♂️</div>
-            <h2 className="text-2xl font-fredoka text-dark-text mb-4">
-              Mulai Proyek Klasifikasi Gerakan
-            </h2>
+            <h2 className="text-2xl font-fredoka text-dark-text mb-4">Mulai Proyek Klasifikasi Gerakan</h2>
             <p className="text-gray-600 text-lg max-w-2xl mx-auto">
-              Nyalakan kamera dan lakukan berbagai pose untuk setiap kelas. 
-              AI akan belajar mengenali perbedaan gerakan tubuh Anda! 
-              Minimal 3 pose per kelas diperlukan untuk pelatihan.
+              Nyalakan kamera, rekam pose untuk tiap kelas, lalu latih model. Sistem akan mengenali pola pose dari data visual yang dikumpulkan.
             </p>
           </div>
         )}
 
-        {/* Hidden canvas for image capture */}
         <canvas ref={canvasRef} className="hidden" />
-
       </div>
     </div>
   );

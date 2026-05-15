@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import * as tf from "@tensorflow/tfjs";
 
 export interface TrainingProgress {
@@ -26,9 +26,62 @@ export interface PredictionResult {
   confidence: number;
 }
 
+export interface SavedImageModel {
+  id: string;
+  name: string;
+  labels: string[];
+  createdAt: number;
+  updatedAt: number;
+  sampleCount: number;
+}
+
+interface SaveModelOptions {
+  sampleCount?: number;
+}
+
 const MOBILE_NET_URL = "https://storage.googleapis.com/tfjs-models/tfjs/mobilenet_v1_0.25_224/model.json";
 const IMAGE_SIZE = 224;
 const TOTAL_EPOCHS = 35;
+
+const MODEL_REGISTRY_KEY = "teachable-ai:image-model-registry:v1";
+const MODEL_STORAGE_PREFIX = "teachable-ai-image-model:";
+const MODEL_LABELS_KEY_PREFIX = "teachable-ai:image-model-labels:";
+
+const buildModelUrl = (id: string) => `indexeddb://${MODEL_STORAGE_PREFIX}${id}`;
+const buildLabelKey = (id: string) => `${MODEL_LABELS_KEY_PREFIX}${id}`;
+
+const safeJsonParse = <T>(value: string | null, fallback: T): T => {
+  if (!value) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+};
+
+const readRegistry = (): SavedImageModel[] => {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  const parsed = safeJsonParse<SavedImageModel[]>(localStorage.getItem(MODEL_REGISTRY_KEY), []);
+  return parsed.filter((item) => item && typeof item.id === "string" && typeof item.name === "string");
+};
+
+const writeRegistry = (records: SavedImageModel[]) => {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  localStorage.setItem(MODEL_REGISTRY_KEY, JSON.stringify(records));
+};
+
+const sortRegistry = (records: SavedImageModel[]) => [...records].sort((a, b) => b.updatedAt - a.updatedAt);
+
+const generateModelId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 export function useTensorFlow() {
   const [isLoading, setIsLoading] = useState(false);
@@ -37,6 +90,40 @@ export function useTensorFlow() {
   const [trainingProgress, setTrainingProgress] = useState<TrainingProgress | null>(null);
   const [isModelTrained, setIsModelTrained] = useState(false);
   const [classLabels, setClassLabels] = useState<string[]>([]);
+  const [savedModels, setSavedModels] = useState<SavedImageModel[]>([]);
+  const [activeModelId, setActiveModelId] = useState<string | null>(null);
+
+  const modelRef = useRef<tf.LayersModel | null>(null);
+  const baseModelRef = useRef<tf.LayersModel | null>(null);
+  const baseModelLoadPromiseRef = useRef<Promise<tf.LayersModel> | null>(null);
+
+  const replaceActiveModel = useCallback((nextModel: tf.LayersModel | null) => {
+    if (modelRef.current && modelRef.current !== nextModel) {
+      modelRef.current.dispose();
+    }
+
+    modelRef.current = nextModel;
+    setModel(nextModel);
+  }, []);
+
+  const refreshSavedModels = useCallback(async () => {
+    const localRegistry = sortRegistry(readRegistry());
+
+    try {
+      const availableModels = await tf.io.listModels();
+      const filtered = localRegistry.filter((item) => Boolean(availableModels[buildModelUrl(item.id)]));
+
+      if (filtered.length !== localRegistry.length) {
+        writeRegistry(filtered);
+      }
+
+      setSavedModels(sortRegistry(filtered));
+      return sortRegistry(filtered);
+    } catch {
+      setSavedModels(localRegistry);
+      return localRegistry;
+    }
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -53,6 +140,8 @@ export function useTensorFlow() {
       if (!isMounted) {
         return;
       }
+
+      await refreshSavedModels();
     };
 
     initializeTensorFlow().catch((error) => {
@@ -62,24 +151,37 @@ export function useTensorFlow() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [refreshSavedModels]);
 
   const loadBaseModel = useCallback(async () => {
-    if (baseModel) {
-      return baseModel;
+    if (baseModelRef.current) {
+      return baseModelRef.current;
     }
 
-    const mobilenet = await tf.loadLayersModel(MOBILE_NET_URL);
-    const layer = mobilenet.getLayer("conv_pw_13_relu");
-    const featureExtractor = tf.model({
-      inputs: mobilenet.input,
-      outputs: layer.output,
-    });
+    if (baseModelLoadPromiseRef.current) {
+      return baseModelLoadPromiseRef.current;
+    }
 
-    featureExtractor.trainable = false;
-    setBaseModel(featureExtractor);
-    return featureExtractor;
-  }, [baseModel]);
+    baseModelLoadPromiseRef.current = (async () => {
+      const mobilenet = await tf.loadLayersModel(MOBILE_NET_URL);
+      const layer = mobilenet.getLayer("conv_pw_13_relu");
+      const featureExtractor = tf.model({
+        inputs: mobilenet.input,
+        outputs: layer.output,
+      });
+
+      featureExtractor.trainable = false;
+      baseModelRef.current = featureExtractor;
+      setBaseModel(featureExtractor);
+      return featureExtractor;
+    })();
+
+    try {
+      return await baseModelLoadPromiseRef.current;
+    } finally {
+      baseModelLoadPromiseRef.current = null;
+    }
+  }, []);
 
   const preprocessImage = useCallback(async (imageDataUrl: string): Promise<tf.Tensor4D> => {
     return new Promise((resolve, reject) => {
@@ -150,6 +252,7 @@ export function useTensorFlow() {
 
       setIsLoading(true);
       setIsModelTrained(false);
+      setActiveModelId(null);
       setClassLabels(usableClasses.map((cls) => cls.name));
       setTrainingProgress({
         epoch: 0,
@@ -241,12 +344,7 @@ export function useTensorFlow() {
           },
         });
 
-        setModel((prev) => {
-          if (prev) {
-            prev.dispose();
-          }
-          return transferModel;
-        });
+        replaceActiveModel(transferModel);
 
         setIsModelTrained(true);
         setTrainingProgress((prev) =>
@@ -278,12 +376,13 @@ export function useTensorFlow() {
         setIsLoading(false);
       }
     },
-    [extractFeatures],
+    [extractFeatures, replaceActiveModel],
   );
 
   const predictImage = useCallback(
     async (imageDataUrl: string): Promise<PredictionResult[]> => {
-      if (!model || !isModelTrained) {
+      const currentModel = modelRef.current;
+      if (!currentModel || !isModelTrained) {
         throw new Error("Model belum dilatih.");
       }
 
@@ -294,7 +393,7 @@ export function useTensorFlow() {
 
         try {
           const features = base.predict(preprocessed) as tf.Tensor4D;
-          const prediction = model.predict(features) as tf.Tensor2D;
+          const prediction = currentModel.predict(features) as tf.Tensor2D;
           const probabilities = Array.from(await prediction.data());
 
           features.dispose();
@@ -313,61 +412,136 @@ export function useTensorFlow() {
         setIsLoading(false);
       }
     },
-    [model, isModelTrained, classLabels, loadBaseModel, preprocessImage],
+    [isModelTrained, classLabels, loadBaseModel, preprocessImage],
   );
 
   const saveModel = useCallback(
-    async (name: string): Promise<void> => {
-      if (!model || !isModelTrained) {
+    async (name: string, options?: SaveModelOptions): Promise<SavedImageModel> => {
+      const currentModel = modelRef.current;
+      if (!currentModel || !isModelTrained) {
         throw new Error("Tidak ada model terlatih untuk disimpan.");
       }
 
+      const trimmedName = name.trim();
+      if (!trimmedName) {
+        throw new Error("Nama model tidak boleh kosong.");
+      }
+
+      const modelId = generateModelId();
+      const now = Date.now();
+      const record: SavedImageModel = {
+        id: modelId,
+        name: trimmedName,
+        labels: classLabels,
+        createdAt: now,
+        updatedAt: now,
+        sampleCount: options?.sampleCount ?? 0,
+      };
+
       setIsLoading(true);
       try {
-        await model.save(`indexeddb://${name}`);
-        localStorage.setItem(`${name}_labels`, JSON.stringify(classLabels));
+        await currentModel.save(buildModelUrl(modelId));
+        localStorage.setItem(buildLabelKey(modelId), JSON.stringify(classLabels));
+
+        const updatedRegistry = sortRegistry([record, ...readRegistry()]);
+        writeRegistry(updatedRegistry);
+        setSavedModels(updatedRegistry);
+        setActiveModelId(modelId);
+
+        return record;
       } finally {
         setIsLoading(false);
       }
     },
-    [model, isModelTrained, classLabels],
+    [isModelTrained, classLabels],
   );
 
-  const loadModel = useCallback(async (name: string): Promise<void> => {
-    setIsLoading(true);
-    try {
-      const loadedModel = await tf.loadLayersModel(`indexeddb://${name}`);
-      const labelsRaw = localStorage.getItem(`${name}_labels`);
+  const loadModel = useCallback(
+    async (modelId: string): Promise<SavedImageModel | null> => {
+      setIsLoading(true);
+      try {
+        const loadedModel = await tf.loadLayersModel(buildModelUrl(modelId));
+        const registry = readRegistry();
+        const existingRecord = registry.find((item) => item.id === modelId) ?? null;
 
-      if (!labelsRaw) {
-        loadedModel.dispose();
-        throw new Error("Label kelas model tidak ditemukan.");
-      }
+        const labelsFromStorage = safeJsonParse<string[]>(localStorage.getItem(buildLabelKey(modelId)), []);
+        const labels = labelsFromStorage.length > 0 ? labelsFromStorage : existingRecord?.labels ?? [];
 
-      const labels = JSON.parse(labelsRaw) as string[];
-
-      setModel((prev) => {
-        if (prev) {
-          prev.dispose();
+        if (labels.length === 0) {
+          loadedModel.dispose();
+          throw new Error("Label kelas model tidak ditemukan.");
         }
-        return loadedModel;
-      });
 
-      setClassLabels(labels);
-      setIsModelTrained(true);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
+        replaceActiveModel(loadedModel);
+        setClassLabels(labels);
+        setIsModelTrained(true);
+        setTrainingProgress(null);
+        setActiveModelId(modelId);
+
+        if (existingRecord) {
+          const updatedRecord: SavedImageModel = {
+            ...existingRecord,
+            labels,
+            updatedAt: Date.now(),
+          };
+
+          const updatedRegistry = sortRegistry([
+            updatedRecord,
+            ...registry.filter((item) => item.id !== modelId),
+          ]);
+          writeRegistry(updatedRegistry);
+          setSavedModels(updatedRegistry);
+          return updatedRecord;
+        }
+
+        await refreshSavedModels();
+        return null;
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [replaceActiveModel, refreshSavedModels],
+  );
+
+  const deleteSavedModel = useCallback(
+    async (modelId: string): Promise<void> => {
+      setIsLoading(true);
+      try {
+        try {
+          await tf.io.removeModel(buildModelUrl(modelId));
+        } catch {
+          // ignore missing model in IndexedDB
+        }
+
+        localStorage.removeItem(buildLabelKey(modelId));
+
+        const remaining = readRegistry().filter((item) => item.id !== modelId);
+        writeRegistry(remaining);
+        setSavedModels(sortRegistry(remaining));
+
+        if (activeModelId === modelId) {
+          replaceActiveModel(null);
+          setIsModelTrained(false);
+          setClassLabels([]);
+          setTrainingProgress(null);
+          setActiveModelId(null);
+        }
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [activeModelId, replaceActiveModel],
+  );
 
   const downloadModel = useCallback(async (): Promise<void> => {
-    if (!model || !isModelTrained) {
+    const currentModel = modelRef.current;
+    if (!currentModel || !isModelTrained) {
       throw new Error("Tidak ada model terlatih untuk diunduh.");
     }
 
     setIsLoading(true);
     try {
-      await model.save("downloads://teachable-ai-model");
+      await currentModel.save("downloads://teachable-ai-model");
 
       const labelsBlob = new Blob([JSON.stringify(classLabels, null, 2)], {
         type: "application/json",
@@ -384,42 +558,45 @@ export function useTensorFlow() {
     } finally {
       setIsLoading(false);
     }
-  }, [model, isModelTrained, classLabels]);
+  }, [isModelTrained, classLabels]);
 
   const resetModel = useCallback(() => {
-    setModel((prev) => {
-      if (prev) {
-        prev.dispose();
-      }
-      return null;
-    });
-
+    replaceActiveModel(null);
     setIsModelTrained(false);
     setClassLabels([]);
     setTrainingProgress(null);
-  }, []);
+    setActiveModelId(null);
+  }, [replaceActiveModel]);
 
   useEffect(() => {
     return () => {
-      if (model) {
-        model.dispose();
+      if (modelRef.current) {
+        modelRef.current.dispose();
+        modelRef.current = null;
       }
-      if (baseModel) {
-        baseModel.dispose();
+
+      if (baseModelRef.current) {
+        baseModelRef.current.dispose();
+        baseModelRef.current = null;
       }
     };
-  }, [model, baseModel]);
+  }, []);
 
   return {
     isLoading,
     model,
+    baseModel,
     isModelTrained,
     trainingProgress,
     classLabels,
+    savedModels,
+    activeModelId,
     trainModel,
     predictImage,
     saveModel,
     loadModel,
+    deleteSavedModel,
+    refreshSavedModels,
     downloadModel,
     resetModel,
     loadBaseModel,

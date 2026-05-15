@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -8,7 +8,7 @@ import { useTensorFlow, type ClassData } from "@/hooks/use-tensorflow";
 import WebcamCapture from "@/components/webcam-capture";
 import TrainingInterface from "@/components/training-interface";
 import TestingInterface from "@/components/testing-interface";
-import { Plus, Upload, Camera, Play, Brain, TestTube } from "lucide-react";
+import { Plus, Upload, Camera, Play, Brain, TestTube, Save, FolderOpen, Trash2 } from "lucide-react";
 
 const STEPS = [
   { id: 1, title: "Kumpulkan", icon: Upload },
@@ -37,19 +37,38 @@ export default function ImageClassifier() {
   const [showWebcam, setShowWebcam] = useState(false);
   const [activeClassId, setActiveClassId] = useState<string | null>(null);
   const [trainingError, setTrainingError] = useState<string | null>(null);
+  const [modelName, setModelName] = useState("");
+  const [loadingModelId, setLoadingModelId] = useState<string | null>(null);
 
   const { toast } = useToast();
   const {
     isLoading,
     trainModel,
     predictImage,
+    saveModel,
+    loadModel,
+    deleteSavedModel,
     downloadModel,
     resetModel,
     isModelTrained,
     trainingProgress,
+    classLabels,
+    savedModels,
+    activeModelId,
   } = useTensorFlow();
 
   const trainableClasses = useMemo(() => classes.filter((cls) => cls.samples.length > 0), [classes]);
+  const testableClasses = useMemo(
+    () =>
+      trainableClasses.length > 0
+        ? trainableClasses
+        : classLabels.map((label, index) => ({
+            id: `saved-class-${index}`,
+            name: label,
+            samples: [],
+          })),
+    [trainableClasses, classLabels],
+  );
 
   const invalidateTrainedModel = () => {
     if (isModelTrained) {
@@ -211,6 +230,86 @@ export default function ImageClassifier() {
   };
 
   const canTrain = trainableClasses.length >= 2;
+  const totalTrainSamples = trainableClasses.reduce((sum, cls) => sum + cls.samples.length, 0);
+
+  const formatDateTime = (timestamp: number) =>
+    new Date(timestamp).toLocaleString("id-ID", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+
+  const handleSaveModel = async () => {
+    if (!isModelTrained) {
+      toast({
+        title: "Model belum siap",
+        description: "Latih model terlebih dahulu sebelum menyimpan.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const fallbackName = `Model ${new Date().toLocaleDateString("id-ID")}`;
+    const finalName = modelName.trim() || fallbackName;
+
+    try {
+      const record = await saveModel(finalName, { sampleCount: totalTrainSamples });
+      setModelName(record.name);
+      toast({
+        title: "Model disimpan",
+        description: `"${record.name}" tersimpan dan bisa dibuka kembali kapan saja.`,
+      });
+    } catch (error) {
+      toast({
+        title: "Simpan model gagal",
+        description: error instanceof Error ? error.message : "Terjadi kesalahan saat menyimpan model.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleLoadSavedModel = async (savedModelId: string) => {
+    try {
+      setLoadingModelId(savedModelId);
+      const loadedRecord = await loadModel(savedModelId);
+      if (loadedRecord) {
+        setModelName(loadedRecord.name);
+      }
+      setCurrentStep(3);
+      toast({
+        title: "Model dibuka",
+        description: "Model tersimpan siap dipakai untuk pengujian.",
+      });
+    } catch (error) {
+      toast({
+        title: "Gagal membuka model",
+        description: error instanceof Error ? error.message : "Terjadi kesalahan saat memuat model.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoadingModelId(null);
+    }
+  };
+
+  const handleDeleteSavedModel = async (savedModelId: string, savedModelName: string) => {
+    const confirmed = window.confirm(`Hapus model \"${savedModelName}\" dari penyimpanan?`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await deleteSavedModel(savedModelId);
+      toast({
+        title: "Model dihapus",
+        description: `Model \"${savedModelName}\" sudah dihapus dari penyimpanan.`,
+      });
+    } catch (error) {
+      toast({
+        title: "Gagal menghapus model",
+        description: error instanceof Error ? error.message : "Terjadi kesalahan saat menghapus model.",
+        variant: "destructive",
+      });
+    }
+  };
 
   return (
     <div className="min-h-screen bg-light-gray py-8">
@@ -238,6 +337,83 @@ export default function ImageClassifier() {
             })}
           </div>
         </div>
+
+        <Card className="mb-8 bg-white rounded-3xl shadow-xl">
+          <CardHeader>
+            <CardTitle className="text-2xl font-fredoka text-dark-text">Model AI Tersimpan</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid md:grid-cols-[1fr_auto] gap-4 items-end mb-6">
+              <div>
+                <label className="text-sm font-semibold text-gray-600">Nama Model</label>
+                <Input
+                  value={modelName}
+                  onChange={(event) => setModelName(event.target.value)}
+                  placeholder="Contoh: Model Hewan Kelas 4A"
+                />
+              </div>
+              <Button
+                onClick={handleSaveModel}
+                disabled={!isModelTrained || isLoading}
+                className="bg-success-green text-white hover:bg-green-600 h-11 px-6"
+              >
+                <Save className="mr-2 h-4 w-4" />
+                Simpan Model AI
+              </Button>
+            </div>
+
+            {savedModels.length > 0 ? (
+              <div className="space-y-3">
+                {savedModels.map((savedModel) => (
+                  <div
+                    key={savedModel.id}
+                    className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 rounded-2xl border border-gray-200 p-4"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <p className="font-bold text-dark-text">{savedModel.name}</p>
+                        {activeModelId === savedModel.id && <Badge className="bg-google-blue text-white">Aktif</Badge>}
+                      </div>
+                      <p className="text-sm text-gray-600">
+                        {savedModel.labels.length} kelas · {savedModel.sampleCount} sampel · diperbarui{" "}
+                        {formatDateTime(savedModel.updatedAt)}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        onClick={() => {
+                          handleLoadSavedModel(savedModel.id).catch(() => {
+                            // handled in function
+                          });
+                        }}
+                        disabled={isLoading && loadingModelId === savedModel.id}
+                        className="bg-google-blue text-white hover:bg-blue-600"
+                      >
+                        <FolderOpen className="mr-2 h-4 w-4" />
+                        {isLoading && loadingModelId === savedModel.id ? "Membuka..." : "Buka Uji"}
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        onClick={() => {
+                          handleDeleteSavedModel(savedModel.id, savedModel.name).catch(() => {
+                            // handled in function
+                          });
+                        }}
+                      >
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Hapus
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">
+                Belum ada model tersimpan. Setelah training selesai, isi nama model lalu klik simpan.
+              </p>
+            )}
+          </CardContent>
+        </Card>
 
         {currentStep === 1 && (
           <div className="space-y-8">
@@ -407,7 +583,7 @@ export default function ImageClassifier() {
 
         {currentStep === 3 && (
           <TestingInterface
-            classes={trainableClasses}
+            classes={testableClasses}
             isModelReady={isModelTrained}
             isProcessing={isLoading}
             onPredict={predictImage}
